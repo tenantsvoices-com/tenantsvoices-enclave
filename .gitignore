@@ -1,0 +1,18 @@
+# Build output
+/bin/
+/build/
+
+# OS or editor files
+*.swp
+*.DS_Store
+*.idea/
+*.vscode/
+
+# Local env secrets
+.env
+.env.local
+server_priv.pem
+
+# Go build cache (optional)
+*.test
+*.out
