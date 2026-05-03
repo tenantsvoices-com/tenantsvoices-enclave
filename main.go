@@ -3,38 +3,44 @@ package main
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
-	"net"
+	"log"
+	"net/http"
 	"os"
 
 	"github.com/go-jose/go-jose/v4"
 )
 
-// Secrets (will be initialized based on environment)
 var (
 	secretPepper []byte
 	jweKey       []byte
 )
 
-// Placeholder functions for prod secret retrieval
 func fetchSecretPepperProd() []byte {
 	// TODO: Fetch REVIEW_PEPPER from KMS or enclave memory
+	if v := os.Getenv("REVIEW_PEPPER"); v != "" {
+		return []byte(v)
+	}
 	return []byte("prod-pepper-secret-placeholder")
 }
 
 func fetchJWEKeyProd() []byte {
 	// TODO: Fetch JWE_KEY from KMS or enclave memory
+	if v := os.Getenv("JWE_KEY"); v != "" && len(v) == 32 {
+		return []byte(v)
+	}
 	return []byte("0123456789ABCDEF0123456789ABCDEF") // 32 bytes for AES-256
 }
 
 func initSecrets() {
 	env := os.Getenv("ENV")
-	if env == "dev" {
-		fmt.Println("Running enclave in LOCAL DEV mode")
+	if env == "dev" || env == "" {
+		log.Println("Running enclave in LOCAL DEV mode")
 		secretPepper = []byte("dev-pepper-secret")
-		jweKey = []byte("0123456789ABCDEF0123456789ABCDEF") // 32 bytes
+		jweKey = []byte("0123456789ABCDEF0123456789ABCDEF")
 	} else {
-		fmt.Println("Running enclave in PRODUCTION mode")
+		log.Println("Running enclave in PRODUCTION mode")
 		secretPepper = fetchSecretPepperProd()
 		jweKey = fetchJWEKeyProd()
 	}
@@ -47,8 +53,11 @@ func computeReviewerHash(email string) string {
 }
 
 func generateJWE(reviewerHash string) (string, error) {
-	key := jose.JSONWebKey{Key: jweKey, Algorithm: string(jose.A256GCMKW), Use: "enc"}
-	encrypter, err := jose.NewEncrypter(jose.A256GCM, jose.Recipient{Algorithm: jose.A256GCMKW, Key: key.Key}, nil)
+	encrypter, err := jose.NewEncrypter(
+		jose.A256GCM,
+		jose.Recipient{Algorithm: jose.A256GCMKW, Key: jweKey},
+		nil,
+	)
 	if err != nil {
 		return "", err
 	}
@@ -59,36 +68,54 @@ func generateJWE(reviewerHash string) (string, error) {
 	return obj.CompactSerialize()
 }
 
+type hashRequest struct {
+	Email string `json:"email"`
+}
+
+type hashResponse struct {
+	ReviewerHash string `json:"reviewer_hash"`
+	Token        string `json:"token"`
+}
+
+func hashHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req hashRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Email == "" {
+		http.Error(w, "invalid body", http.StatusBadRequest)
+		return
+	}
+	rh := computeReviewerHash(req.Email)
+	tok, err := generateJWE(rh)
+	if err != nil {
+		http.Error(w, "encryption failed", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(hashResponse{ReviewerHash: rh, Token: tok})
+}
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("ok"))
+}
+
 func main() {
 	initSecrets()
 
-	// Simulate vsock with TCP
-	l, err := net.Listen("tcp", "localhost:5001")
-	if err != nil {
-		panic(err)
+	addr := os.Getenv("ENCLAVE_ADDR")
+	if addr == "" {
+		addr = ":5001"
 	}
-	defer l.Close()
-	fmt.Println("Listening on localhost:5001 (simulated enclave)")
 
-	for {
-		conn, _ := l.Accept()
-		go func(c net.Conn) {
-			defer c.Close()
-			buf := make([]byte, 1024)
-			n, _ := c.Read(buf)
-			email := string(buf[:n])
-			fmt.Printf("Received email: %s\n", email)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/hash", hashHandler)
+	mux.HandleFunc("/health", healthHandler)
 
-			reviewerHash := computeReviewerHash(email)
-			token, err := generateJWE(reviewerHash)
-			if err != nil {
-				fmt.Println("Error generating JWE:", err)
-				return
-			}
-
-			c.Write([]byte(token))
-			fmt.Printf("Sent JWE token: %s\n", token)
-		}(conn)
+	log.Printf("Enclave HTTP service listening on %s", addr)
+	if err := http.ListenAndServe(addr, mux); err != nil {
+		log.Fatal(err)
 	}
 }
-
