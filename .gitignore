@@ -1,6 +1,7 @@
 # Build output
 /bin/
 /build/
+/enclave
 
 # OS or editor files
 *.swp

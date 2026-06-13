@@ -2,28 +2,50 @@ package main
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/go-jose/go-jose/v4"
+	"golang.org/x/crypto/argon2"
 )
 
-var (
-	secretPepper []byte
-	jweKey       []byte
+const tokenTTL = 30 * 24 * time.Hour
+
+// argon2id parameters, shared by email_key and password hashing.
+const (
+	argonTime    = 1
+	argonMemory  = 64 * 1024
+	argonThreads = 4
+	argonKeyLen  = 32
 )
 
-func fetchSecretPepperProd() []byte {
-	// TODO: Fetch REVIEW_PEPPER from KMS or enclave memory
-	if v := os.Getenv("REVIEW_PEPPER"); v != "" {
-		return []byte(v)
-	}
-	return []byte("prod-pepper-secret-placeholder")
+// fixedEmailSalt makes the email_key deterministic (so the same email always
+// maps to the same row). It is not a secret — the secrecy comes from emailPepper.
+var fixedEmailSalt = []byte("tv-email-key-salt-v1")
+
+type tokenPayload struct {
+	ReviewerHash string `json:"sub"`
+	Exp          int64  `json:"exp"`
 }
+
+// Secrets the enclave guards. jweKey encrypts tokens; emailPepper is mixed into
+// the deterministic email_key so a leaked accounts table can't be enumerated by
+// guessing emails. Both are set-once. The reviewer-identity hash uses no pepper:
+// its strength comes from the user's password plus a per-user salt.
+var (
+	jweKey      []byte
+	emailPepper []byte
+)
 
 func fetchJWEKeyProd() []byte {
 	// TODO: Fetch JWE_KEY from KMS or enclave memory
@@ -33,23 +55,49 @@ func fetchJWEKeyProd() []byte {
 	return []byte("0123456789ABCDEF0123456789ABCDEF") // 32 bytes for AES-256
 }
 
+func fetchEmailPepperProd() []byte {
+	// TODO: Fetch EMAIL_PEPPER from KMS or enclave memory
+	if v := os.Getenv("EMAIL_PEPPER"); v != "" {
+		return []byte(v)
+	}
+	return []byte("prod-email-pepper-placeholder")
+}
+
 func initSecrets() {
 	env := os.Getenv("ENV")
 	if env == "dev" || env == "" {
 		log.Println("Running enclave in LOCAL DEV mode")
-		secretPepper = []byte("dev-pepper-secret")
 		jweKey = []byte("0123456789ABCDEF0123456789ABCDEF")
+		emailPepper = []byte("dev-email-pepper")
 	} else {
 		log.Println("Running enclave in PRODUCTION mode")
-		secretPepper = fetchSecretPepperProd()
 		jweKey = fetchJWEKeyProd()
+		emailPepper = fetchEmailPepperProd()
 	}
 }
 
-func computeReviewerHash(email string) string {
-	h := hmac.New(sha256.New, secretPepper)
-	h.Write([]byte(email))
-	return fmt.Sprintf("%x", h.Sum(nil))
+// normalizeEmail lower-cases and trims so "Alice@X.com " and "alice@x.com"
+// resolve to the same account.
+func normalizeEmail(email string) string {
+	return strings.ToLower(strings.TrimSpace(email))
+}
+
+// hashFields hashes a tagged, length-prefixed concatenation of its parts. The
+// length prefixes make the encoding unambiguous (so "ab"+"c" can't collide with
+// "a"+"bc"), and the leading tag domain-separates hash kinds.
+func hashFields(tag string, parts ...string) string {
+	h := sha256.New()
+	write := func(s string) {
+		var n [8]byte
+		binary.BigEndian.PutUint64(n[:], uint64(len(s)))
+		h.Write(n[:])
+		h.Write([]byte(s))
+	}
+	write(tag)
+	for _, p := range parts {
+		write(p)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func generateJWE(reviewerHash string) (string, error) {
@@ -61,40 +109,195 @@ func generateJWE(reviewerHash string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	obj, err := encrypter.Encrypt([]byte(reviewerHash))
+	payload, err := json.Marshal(tokenPayload{
+		ReviewerHash: reviewerHash,
+		Exp:          time.Now().Add(tokenTTL).Unix(),
+	})
+	if err != nil {
+		return "", err
+	}
+	obj, err := encrypter.Encrypt(payload)
 	if err != nil {
 		return "", err
 	}
 	return obj.CompactSerialize()
 }
 
-type hashRequest struct {
-	Email string `json:"email"`
+// verifyJWE decrypts a token, checks expiry, and returns the embedded
+// reviewer_hash. Any decrypt or schema failure yields an error so callers
+// can return 401 without leaking which step failed.
+func verifyJWE(token string) (string, error) {
+	obj, err := jose.ParseEncrypted(
+		token,
+		[]jose.KeyAlgorithm{jose.A256GCMKW},
+		[]jose.ContentEncryption{jose.A256GCM},
+	)
+	if err != nil {
+		return "", err
+	}
+	plaintext, err := obj.Decrypt(jweKey)
+	if err != nil {
+		return "", err
+	}
+	var p tokenPayload
+	if err := json.Unmarshal(plaintext, &p); err != nil {
+		return "", err
+	}
+	if p.ReviewerHash == "" {
+		return "", fmt.Errorf("missing reviewer_hash")
+	}
+	if p.Exp == 0 || time.Now().Unix() >= p.Exp {
+		return "", fmt.Errorf("token expired")
+	}
+	return p.ReviewerHash, nil
 }
 
-type hashResponse struct {
-	ReviewerHash string `json:"reviewer_hash"`
-	Token        string `json:"token"`
+// computeEmailKey derives the deterministic, peppered account lookup key. The
+// email is HMAC'd with the pepper first (argon2 has no secret parameter), then
+// stretched with argon2id against a fixed salt so the output is reproducible.
+func computeEmailKey(email string) string {
+	mac := hmac.New(sha256.New, emailPepper)
+	mac.Write([]byte(normalizeEmail(email)))
+	key := argon2.IDKey(mac.Sum(nil), fixedEmailSalt, argonTime, argonMemory, argonThreads, argonKeyLen)
+	return hex.EncodeToString(key)
 }
 
-func hashHandler(w http.ResponseWriter, r *http.Request) {
+// hashPassword produces a verifier with a fresh random salt, encoded as
+// "saltHex:hashHex". The salt lives with the hash (it is not secret); it only
+// needs to be unique so identical passwords don't collide.
+func hashPassword(password string) (string, error) {
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		return "", err
+	}
+	h := argon2.IDKey([]byte(password), salt, argonTime, argonMemory, argonThreads, argonKeyLen)
+	return hex.EncodeToString(salt) + ":" + hex.EncodeToString(h), nil
+}
+
+// verifyPassword re-derives the hash with the stored salt and compares in
+// constant time.
+func verifyPassword(password, encoded string) bool {
+	parts := strings.SplitN(encoded, ":", 2)
+	if len(parts) != 2 {
+		return false
+	}
+	salt, err := hex.DecodeString(parts[0])
+	if err != nil {
+		return false
+	}
+	want, err := hex.DecodeString(parts[1])
+	if err != nil {
+		return false
+	}
+	got := argon2.IDKey([]byte(password), salt, argonTime, argonMemory, argonThreads, argonKeyLen)
+	return subtle.ConstantTimeCompare(got, want) == 1
+}
+
+func decode(w http.ResponseWriter, r *http.Request, v interface{}) bool {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return false
+	}
+	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+		http.Error(w, "invalid body", http.StatusBadRequest)
+		return false
+	}
+	return true
+}
+
+func writeJSON(w http.ResponseWriter, v interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(v)
+}
+
+// emailKeyHandler derives the peppered account lookup key from an email.
+func emailKeyHandler(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Email string `json:"email"`
+	}
+	if !decode(w, r, &req) {
 		return
 	}
-	var req hashRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Email == "" {
+	if req.Email == "" {
 		http.Error(w, "invalid body", http.StatusBadRequest)
 		return
 	}
-	rh := computeReviewerHash(req.Email)
+	writeJSON(w, map[string]string{"email_key": computeEmailKey(req.Email)})
+}
+
+// hashPasswordHandler returns a fresh argon2id verifier for a password.
+func hashPasswordHandler(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Password string `json:"password"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.Password == "" {
+		http.Error(w, "invalid body", http.StatusBadRequest)
+		return
+	}
+	enc, err := hashPassword(req.Password)
+	if err != nil {
+		http.Error(w, "hash failed", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]string{"password_hash": enc})
+}
+
+// verifyPasswordHandler checks a password against a stored verifier.
+func verifyPasswordHandler(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Password     string `json:"password"`
+		PasswordHash string `json:"password_hash"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	writeJSON(w, map[string]bool{"ok": verifyPassword(req.Password, req.PasswordHash)})
+}
+
+// tokenHandler derives the salted reviewer_hash H(email, password, salt) and
+// wraps it in a JWE. Rotating the salt (done by the API) yields a fresh hash.
+func tokenHandler(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+		Salt     string `json:"salt"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.Email == "" || req.Password == "" || req.Salt == "" {
+		http.Error(w, "invalid body", http.StatusBadRequest)
+		return
+	}
+	rh := hashFields("rev", normalizeEmail(req.Email), req.Password, req.Salt)
 	tok, err := generateJWE(rh)
 	if err != nil {
 		http.Error(w, "encryption failed", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(hashResponse{ReviewerHash: rh, Token: tok})
+	writeJSON(w, map[string]string{"reviewer_hash": rh, "token": tok})
+}
+
+func verifyHandler(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Token string `json:"token"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.Token == "" {
+		http.Error(w, "invalid body", http.StatusBadRequest)
+		return
+	}
+	rh, err := verifyJWE(req.Token)
+	if err != nil {
+		http.Error(w, "invalid token", http.StatusUnauthorized)
+		return
+	}
+	writeJSON(w, map[string]string{"reviewer_hash": rh})
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
@@ -111,7 +314,11 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/hash", hashHandler)
+	mux.HandleFunc("/email-key", emailKeyHandler)
+	mux.HandleFunc("/hash-password", hashPasswordHandler)
+	mux.HandleFunc("/verify-password", verifyPasswordHandler)
+	mux.HandleFunc("/token", tokenHandler)
+	mux.HandleFunc("/verify", verifyHandler)
 	mux.HandleFunc("/health", healthHandler)
 
 	log.Printf("Enclave HTTP service listening on %s", addr)
