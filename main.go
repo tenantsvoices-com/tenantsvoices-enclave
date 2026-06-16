@@ -47,20 +47,38 @@ var (
 	emailPepper []byte
 )
 
-func fetchJWEKeyProd() []byte {
-	// TODO: Fetch JWE_KEY from KMS or enclave memory
-	if v := os.Getenv("JWE_KEY"); v != "" && len(v) == 32 {
-		return []byte(v)
+// fetchJWEKeyProd loads the AES-256 key that encrypts session tokens.
+//
+// MVP: there is no real enclave yet, so the key is supplied via the JWE_KEY env
+// var and we refuse to boot without a valid 32-byte value — no hardcoded
+// fallback, so a misconfigured deploy fails loudly instead of silently signing
+// tokens with a publicly known key.
+//
+// Production (Nitro Enclave) path: replace the env read with a KMS Decrypt call
+// (or read from sealed enclave memory) gated on a successful attestation
+// document, so the key is released only to a verified enclave image and never
+// transits an env var, disk, or the host.
+func fetchJWEKeyProd() ([]byte, error) {
+	v := os.Getenv("JWE_KEY")
+	if v == "" {
+		return nil, fmt.Errorf("JWE_KEY is required in production mode")
 	}
-	return []byte("0123456789ABCDEF0123456789ABCDEF") // 32 bytes for AES-256
+	if len(v) != 32 {
+		return nil, fmt.Errorf("JWE_KEY must be a 32-byte AES-256 key, got %d bytes", len(v))
+	}
+	return []byte(v), nil
 }
 
-func fetchEmailPepperProd() []byte {
-	// TODO: Fetch EMAIL_PEPPER from KMS or enclave memory
-	if v := os.Getenv("EMAIL_PEPPER"); v != "" {
-		return []byte(v)
+// fetchEmailPepperProd loads the pepper mixed into the deterministic email_key.
+// Same contract as fetchJWEKeyProd: required via EMAIL_PEPPER for the MVP, no
+// fallback, and intended to be fetched from KMS / sealed enclave memory under
+// attestation in the production deployment.
+func fetchEmailPepperProd() ([]byte, error) {
+	v := os.Getenv("EMAIL_PEPPER")
+	if v == "" {
+		return nil, fmt.Errorf("EMAIL_PEPPER is required in production mode")
 	}
-	return []byte("prod-email-pepper-placeholder")
+	return []byte(v), nil
 }
 
 func initSecrets() {
@@ -69,10 +87,16 @@ func initSecrets() {
 		log.Println("Running enclave in LOCAL DEV mode")
 		jweKey = []byte("0123456789ABCDEF0123456789ABCDEF")
 		emailPepper = []byte("dev-email-pepper")
-	} else {
-		log.Println("Running enclave in PRODUCTION mode")
-		jweKey = fetchJWEKeyProd()
-		emailPepper = fetchEmailPepperProd()
+		return
+	}
+
+	log.Println("Running enclave in PRODUCTION mode")
+	var err error
+	if jweKey, err = fetchJWEKeyProd(); err != nil {
+		log.Fatalf("enclave secret: %v", err)
+	}
+	if emailPepper, err = fetchEmailPepperProd(); err != nil {
+		log.Fatalf("enclave secret: %v", err)
 	}
 }
 
