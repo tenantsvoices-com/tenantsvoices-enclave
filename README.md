@@ -38,6 +38,29 @@ The enclave guards two secrets:
 | JWE key        | `JWE_KEY`      | AES-256 key (exactly 32 bytes) encrypting session tokens |
 | Email pepper   | `EMAIL_PEPPER` | Mixed into the deterministic `email_key` so a leaked accounts table can't be enumerated by guessing emails |
 
+Two optional settings tune token issuance:
+
+| Setting           | Env var             | Purpose                                            |
+|-------------------|---------------------|----------------------------------------------------|
+| Retired JWE keys  | `JWE_KEYS_RETIRED`  | Comma-separated list of previous 32-byte `JWE_KEY` values, kept **decrypt-only** so tokens minted before a rotation keep verifying. Never used to encrypt new tokens. |
+| Token issuer      | `TOKEN_ISS`         | The `iss` claim stamped into tokens and required on verify (defaults to `tenantsvoices-enclave`). |
+
+### Token claims & rotation
+
+Each session token is a JWE whose plaintext carries JWT-style claims: `sub`
+(reviewer hash), `iss` (issuer), and `iat` / `nbf` / `exp` (issued-at /
+not-before / expiry, Unix seconds). Verify rejects a token whose issuer doesn't
+match, that has expired, or that isn't valid yet — with a small `clockSkew`
+leeway on the time checks.
+
+Tokens are tagged with the **key id** (`kid`, first 8 hex of the key's SHA-256)
+of the key that encrypted them. To **rotate** the JWE key: set the new key as
+`JWE_KEY` and move the old one into `JWE_KEYS_RETIRED`. New tokens are encrypted
+under the new primary, while tokens still bearing the old `kid` are decrypted
+with the retired key until they age out — at which point the retired entry can be
+dropped. Verify selects the key by `kid` and falls back to trying the whole
+keyring, so an unknown `kid` never short-circuits a valid token.
+
 Behavior is selected by `ENV`:
 
 - **`ENV=dev` (or unset)** — local dev mode. Fixed, well-known dev values are used for both secrets. **Never use this in production.**

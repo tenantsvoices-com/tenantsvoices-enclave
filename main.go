@@ -21,6 +21,15 @@ import (
 
 const tokenTTL = 30 * 24 * time.Hour
 
+// defaultIssuer is the `iss` claim stamped into every token and required on
+// verify. Override with TOKEN_ISS if the enclave is deployed under another name.
+const defaultIssuer = "tenantsvoices-enclave"
+
+// clockSkew is the leeway allowed when checking the time-based claims (nbf/exp)
+// so small clock drift between the enclave and a verifier doesn't reject
+// otherwise-valid tokens.
+const clockSkew = 60 * time.Second
+
 // argon2id parameters, shared by email_key and password hashing.
 const (
 	argonTime    = 1
@@ -33,8 +42,14 @@ const (
 // maps to the same row). It is not a secret — the secrecy comes from emailPepper.
 var fixedEmailSalt = []byte("tv-email-key-salt-v1")
 
+// tokenPayload is the JWE plaintext. Claims follow JWT naming so their meaning
+// is conventional: sub = reviewer hash, iss = issuer, and iat/nbf/exp are the
+// issued-at / not-before / expiry times in Unix seconds.
 type tokenPayload struct {
 	ReviewerHash string `json:"sub"`
+	Iss          string `json:"iss"`
+	Iat          int64  `json:"iat"`
+	Nbf          int64  `json:"nbf"`
 	Exp          int64  `json:"exp"`
 }
 
@@ -42,10 +57,39 @@ type tokenPayload struct {
 // the deterministic email_key so a leaked accounts table can't be enumerated by
 // guessing emails. Both are set-once. The reviewer-identity hash uses no pepper:
 // its strength comes from the user's password plus a per-user salt.
+// jweKeyEntry is a JWE key plus its short identifier. The kid is published in
+// each token's header so verify can pick the exact key that encrypted it —
+// which is what makes rotation possible without a flag day.
+type jweKeyEntry struct {
+	kid string
+	key []byte
+}
+
 var (
-	jweKey      []byte
+	// jwePrimary encrypts new tokens (and can also decrypt). After a rotation
+	// the previous primary is demoted into jweKeyring as decrypt-only, so tokens
+	// minted before the rotation keep verifying until they expire.
+	jwePrimary  jweKeyEntry
+	jweKeyring  map[string]jweKeyEntry // kid -> key; every key we can decrypt with
+	tokenIssuer string
+
 	emailPepper []byte
 )
+
+// keyID derives a short, stable identifier for a key (first 8 hex of its
+// SHA-256). It isn't secret — it only needs to be collision-resistant enough to
+// name keys in a small keyring.
+func keyID(key []byte) string {
+	sum := sha256.Sum256(key)
+	return hex.EncodeToString(sum[:4])
+}
+
+// addKey registers a key in the keyring under its kid and returns the entry.
+func addKey(key []byte) jweKeyEntry {
+	k := jweKeyEntry{kid: keyID(key), key: key}
+	jweKeyring[k.kid] = k
+	return k
+}
 
 // fetchJWEKeyProd loads the AES-256 key that encrypts session tokens.
 //
@@ -81,23 +125,64 @@ func fetchEmailPepperProd() ([]byte, error) {
 	return []byte(v), nil
 }
 
+// fetchRetiredJWEKeysProd loads zero or more decrypt-only keys from
+// JWE_KEYS_RETIRED (comma-separated, each a 32-byte AES-256 key). These are the
+// previous primaries kept alive so tokens minted under them survive a rotation;
+// once every token signed under a retired key has expired it can be dropped from
+// the var.
+func fetchRetiredJWEKeysProd() [][]byte {
+	v := strings.TrimSpace(os.Getenv("JWE_KEYS_RETIRED"))
+	if v == "" {
+		return nil
+	}
+	var out [][]byte
+	for _, part := range strings.Split(v, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if len(part) != 32 {
+			log.Fatalf("enclave secret: each JWE_KEYS_RETIRED entry must be a 32-byte AES-256 key, got %d bytes", len(part))
+		}
+		out = append(out, []byte(part))
+	}
+	return out
+}
+
 func initSecrets() {
+	jweKeyring = make(map[string]jweKeyEntry)
+	tokenIssuer = os.Getenv("TOKEN_ISS")
+	if tokenIssuer == "" {
+		tokenIssuer = defaultIssuer
+	}
+
 	env := os.Getenv("ENV")
 	if env == "dev" || env == "" {
 		log.Println("Running enclave in LOCAL DEV mode")
-		jweKey = []byte("0123456789ABCDEF0123456789ABCDEF")
+		jwePrimary = addKey([]byte("0123456789ABCDEF0123456789ABCDEF"))
 		emailPepper = []byte("dev-email-pepper")
 		return
 	}
 
 	log.Println("Running enclave in PRODUCTION mode")
-	var err error
-	if jweKey, err = fetchJWEKeyProd(); err != nil {
+	primary, err := fetchJWEKeyProd()
+	if err != nil {
 		log.Fatalf("enclave secret: %v", err)
 	}
+	jwePrimary = addKey(primary)
+
+	// Retired keys are decrypt-only: registering them in the keyring lets tokens
+	// minted under a previous JWE_KEY keep verifying through the overlap window
+	// after a rotation. They are never selected to encrypt new tokens.
+	for _, k := range fetchRetiredJWEKeysProd() {
+		retired := addKey(k)
+		log.Printf("loaded retired JWE key %s (decrypt-only)", retired.kid)
+	}
+
 	if emailPepper, err = fetchEmailPepperProd(); err != nil {
 		log.Fatalf("enclave secret: %v", err)
 	}
+	log.Printf("primary JWE key %s; issuer %q", jwePrimary.kid, tokenIssuer)
 }
 
 // normalizeEmail lower-cases and trims so "Alice@X.com " and "alice@x.com"
@@ -127,15 +212,19 @@ func hashFields(tag string, parts ...string) string {
 func generateJWE(reviewerHash string) (string, error) {
 	encrypter, err := jose.NewEncrypter(
 		jose.A256GCM,
-		jose.Recipient{Algorithm: jose.A256GCMKW, Key: jweKey},
+		jose.Recipient{Algorithm: jose.A256GCMKW, Key: jwePrimary.key, KeyID: jwePrimary.kid},
 		nil,
 	)
 	if err != nil {
 		return "", err
 	}
+	now := time.Now()
 	payload, err := json.Marshal(tokenPayload{
 		ReviewerHash: reviewerHash,
-		Exp:          time.Now().Add(tokenTTL).Unix(),
+		Iss:          tokenIssuer,
+		Iat:          now.Unix(),
+		Nbf:          now.Unix(),
+		Exp:          now.Add(tokenTTL).Unix(),
 	})
 	if err != nil {
 		return "", err
@@ -147,9 +236,11 @@ func generateJWE(reviewerHash string) (string, error) {
 	return obj.CompactSerialize()
 }
 
-// verifyJWE decrypts a token, checks expiry, and returns the embedded
-// reviewer_hash. Any decrypt or schema failure yields an error so callers
-// can return 401 without leaking which step failed.
+// verifyJWE decrypts a token, validates its claims, and returns the embedded
+// reviewer_hash. It selects the decryption key by the `kid` header (falling back
+// to trying every known key) so tokens issued under a rotated-out key still
+// verify. Any decrypt or claim failure yields an error so callers can return 401
+// without leaking which step failed.
 func verifyJWE(token string) (string, error) {
 	obj, err := jose.ParseEncrypted(
 		token,
@@ -159,10 +250,12 @@ func verifyJWE(token string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	plaintext, err := obj.Decrypt(jweKey)
+
+	plaintext, err := decryptWithKeyring(obj)
 	if err != nil {
 		return "", err
 	}
+
 	var p tokenPayload
 	if err := json.Unmarshal(plaintext, &p); err != nil {
 		return "", err
@@ -170,10 +263,35 @@ func verifyJWE(token string) (string, error) {
 	if p.ReviewerHash == "" {
 		return "", fmt.Errorf("missing reviewer_hash")
 	}
-	if p.Exp == 0 || time.Now().Unix() >= p.Exp {
+	if p.Iss != tokenIssuer {
+		return "", fmt.Errorf("unexpected issuer")
+	}
+	now := time.Now()
+	if p.Exp == 0 || now.Add(-clockSkew).Unix() >= p.Exp {
 		return "", fmt.Errorf("token expired")
 	}
+	if p.Nbf != 0 && now.Add(clockSkew).Unix() < p.Nbf {
+		return "", fmt.Errorf("token not yet valid")
+	}
 	return p.ReviewerHash, nil
+}
+
+// decryptWithKeyring tries the key named by the token's kid header first, then
+// falls back to every key in the ring. The fallback keeps verification working
+// for tokens whose kid we don't recognise and is cheap because the ring holds at
+// most a handful of keys.
+func decryptWithKeyring(obj *jose.JSONWebEncryption) ([]byte, error) {
+	if kid := obj.Header.KeyID; kid != "" {
+		if k, ok := jweKeyring[kid]; ok {
+			return obj.Decrypt(k.key)
+		}
+	}
+	for _, k := range jweKeyring {
+		if pt, err := obj.Decrypt(k.key); err == nil {
+			return pt, nil
+		}
+	}
+	return nil, fmt.Errorf("no key could decrypt token")
 }
 
 // computeEmailKey derives the deterministic, peppered account lookup key. The
